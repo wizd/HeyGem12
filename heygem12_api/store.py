@@ -1,11 +1,12 @@
-"""SQLite persistence for assets, lipsync jobs, batches and idempotency keys."""
+"""SQLite persistence for assets, lipsync generations and idempotency keys."""
 import json
 import sqlite3
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
+# batch_id / item_index columns are unused (kept so databases from 1.x still open).
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
     id TEXT PRIMARY KEY, filename TEXT, path TEXT NOT NULL, mime_type TEXT,
@@ -19,20 +20,17 @@ CREATE TABLE IF NOT EXISTS lipsyncs (
     created_at INTEGER NOT NULL, started_at INTEGER, completed_at INTEGER,
     duration REAL, output_path TEXT, failure_code TEXT, failure_message TEXT);
 CREATE INDEX IF NOT EXISTS ix_lipsyncs_status ON lipsyncs(status, seq);
-CREATE INDEX IF NOT EXISTS ix_lipsyncs_batch ON lipsyncs(batch_id, item_index);
-CREATE TABLE IF NOT EXISTS batches (
-    id TEXT PRIMARY KEY, title TEXT, callback_url TEXT, base_url TEXT,
-    total_items INTEGER NOT NULL, created_at INTEGER NOT NULL, notified INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS idempotency (
     key TEXT NOT NULL, scope TEXT NOT NULL, status_code INTEGER, response TEXT,
     created_at INTEGER NOT NULL, PRIMARY KEY (key, scope));
 """
 
 TERMINAL = ("completed", "failed")
+IDEM_TTL = 7 * 24 * 3600
 
 
 def new_id() -> str:
-    return uuid.uuid4().hex
+    return str(uuid.uuid4())
 
 
 def now() -> int:
@@ -65,34 +63,52 @@ class Store:
         r = self._q("SELECT * FROM assets WHERE id=?", (asset_id,))
         return dict(r[0]) if r else None
 
+    def list_assets(self, limit: int, offset: int, mime_prefixes: Sequence[str] = ()) -> List[Dict[str, Any]]:
+        where, args = self._mime_filter(mime_prefixes)
+        return [dict(r) for r in self._q(
+            f"SELECT * FROM assets {where} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?",
+            (*args, limit + 1, offset))]
+
+    def count_assets(self, mime_prefixes: Sequence[str] = ()) -> int:
+        where, args = self._mime_filter(mime_prefixes)
+        return self._q(f"SELECT COUNT(*) n FROM assets {where}", args)[0]["n"]
+
+    @staticmethod
+    def _mime_filter(prefixes: Sequence[str]):
+        if not prefixes:
+            return "", ()
+        return "WHERE " + " OR ".join("mime_type LIKE ?" for _ in prefixes), tuple(p + "%" for p in prefixes)
+
     def delete_asset(self, asset_id) -> bool:
         return self._x("DELETE FROM assets WHERE id=?", (asset_id,)) > 0
 
-    # -------------------------------------------------------------- lipsyncs
-    def add_lipsync(self, req: Dict[str, Any], base_url: str, batch_id=None, item_index=None) -> str:
+    # ----------------------------------------------------------- generations
+    def add_lipsync(self, req: Dict[str, Any], base_url: str) -> str:
         lid = new_id()
-        self._x("""INSERT INTO lipsyncs (id, status, title, request, callback_url, callback_id,
-                   base_url, batch_id, item_index, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (lid, "pending", req.get("title"), json.dumps(req), req.get("callback_url"),
-                 req.get("callback_id"), base_url, batch_id, item_index, now()))
+        self._x("""INSERT INTO lipsyncs (id, status, request, callback_url, base_url, created_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (lid, "pending", json.dumps(req), req.get("webhookUrl"), base_url, now()))
         return lid
 
     def get_lipsync(self, lid) -> Optional[Dict[str, Any]]:
         r = self._q("SELECT * FROM lipsyncs WHERE id=?", (lid,))
         return dict(r[0]) if r else None
 
-    def list_lipsyncs(self, limit: int, offset: int) -> List[Dict[str, Any]]:
+    def list_lipsyncs(self, limit: int, before_seq: Optional[int] = None,
+                      statuses: Sequence[str] = (), ids: Sequence[str] = ()) -> List[Dict[str, Any]]:
+        cond, args = [], []
+        if before_seq is not None:
+            cond.append("seq < ?")
+            args.append(before_seq)
+        if statuses:
+            cond.append(f"status IN ({','.join('?' * len(statuses))})")
+            args.extend(statuses)
+        if ids:
+            cond.append(f"id IN ({','.join('?' * len(ids))})")
+            args.extend(ids)
+        where = ("WHERE " + " AND ".join(cond)) if cond else ""
         return [dict(r) for r in self._q(
-            "SELECT * FROM lipsyncs ORDER BY seq DESC LIMIT ? OFFSET ?", (limit + 1, offset))]
-
-    def batch_items(self, batch_id, limit: int, offset: int) -> List[Dict[str, Any]]:
-        return [dict(r) for r in self._q(
-            "SELECT * FROM lipsyncs WHERE batch_id=? ORDER BY item_index LIMIT ? OFFSET ?",
-            (batch_id, limit + 1, offset))]
-
-    def batch_counts(self, batch_id) -> Dict[str, int]:
-        return {r["status"]: r["n"] for r in self._q(
-            "SELECT status, COUNT(*) n FROM lipsyncs WHERE batch_id=? GROUP BY status", (batch_id,))}
+            f"SELECT * FROM lipsyncs {where} ORDER BY seq DESC LIMIT ?", (*args, limit + 1))]
 
     def update_lipsync(self, lid, **fields) -> None:
         if not fields:
@@ -120,31 +136,16 @@ class Store:
         """At startup, jobs left 'running' by a crash/restart go back to the queue."""
         return self._x("UPDATE lipsyncs SET status='pending', started_at=NULL WHERE status='running'")
 
-    # --------------------------------------------------------------- batches
-    def add_batch(self, title, callback_url, base_url, total) -> str:
-        bid = new_id()
-        self._x("INSERT INTO batches (id, title, callback_url, base_url, total_items, created_at) "
-                "VALUES (?,?,?,?,?,?)", (bid, title, callback_url, base_url, total, now()))
-        return bid
-
-    def get_batch(self, bid) -> Optional[Dict[str, Any]]:
-        r = self._q("SELECT * FROM batches WHERE id=?", (bid,))
-        return dict(r[0]) if r else None
-
-    def mark_batch_notified(self, bid) -> bool:
-        """True exactly once per batch (guards against duplicate batch webhooks)."""
-        return self._x("UPDATE batches SET notified=1 WHERE id=? AND notified=0", (bid,)) > 0
-
     # ----------------------------------------------------------- idempotency
-    def idem_get(self, key, scope, ttl=24 * 3600):
+    def idem_get(self, key, scope):
         r = self._q("SELECT * FROM idempotency WHERE key=? AND scope=? AND created_at>?",
-                    (key, scope, now() - ttl))
+                    (key, scope, now() - IDEM_TTL))
         return dict(r[0]) if r else None
 
     def idem_reserve(self, key, scope) -> bool:
         """Reserve a key (status_code NULL = in flight). False if already present and live."""
         with self._lock:
-            self._x("DELETE FROM idempotency WHERE created_at<?", (now() - 24 * 3600,))
+            self._x("DELETE FROM idempotency WHERE created_at<?", (now() - IDEM_TTL,))
             try:
                 self._x("INSERT INTO idempotency (key, scope, created_at) VALUES (?,?,?)", (key, scope, now()))
                 return True
@@ -157,3 +158,6 @@ class Store:
 
     def idem_release(self, key, scope) -> None:
         self._x("DELETE FROM idempotency WHERE key=? AND scope=? AND status_code IS NULL", (key, scope))
+
+    def idem_delete(self, key, scope) -> None:
+        self._x("DELETE FROM idempotency WHERE key=? AND scope=?", (key, scope))

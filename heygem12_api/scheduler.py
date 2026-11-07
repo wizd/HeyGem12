@@ -9,12 +9,13 @@ import subprocess
 import threading
 import time
 import urllib.request
+import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from . import media
 from .config import settings
-from .store import TERMINAL, Store, now
+from .store import Store, now
 from .worker import worker_main
 
 log = logging.getLogger("heygem12_api.scheduler")
@@ -26,10 +27,32 @@ class JobFailure(Exception):
         self.code, self.message = code, message
 
 
+def job_inputs(req: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """{'video': spec, 'audio': spec}; spec has 'url' or 'assetId'. Also reads the
+    1.x request format ({video: {type: url|asset_id, ...}, audio: ...})."""
+    if "input" in req:
+        return {it["type"]: it for it in req["input"]}
+    out = {}
+    for t in ("video", "audio"):
+        old = req[t]
+        out[t] = {"type": t, "url": old["url"]} if old["type"] == "url" else {"type": t, "assetId": old["asset_id"]}
+    return out
+
+
+def job_sync_mode(req: Dict[str, Any]) -> str:
+    if "input" in req:
+        return (req.get("options") or {}).get("sync_mode") or "bounce"
+    return "bounce" if req.get("enable_dynamic_duration", True) else "cut_off"
+
+
+def job_precision(req: Dict[str, Any]) -> bool:
+    return bool(req.get("precision")) or req.get("mode") == "precision"
+
+
 class Scheduler:
-    def __init__(self, store: Store, urls):
+    def __init__(self, store: Store, view: Callable[[Dict[str, Any]], Dict[str, Any]]):
         self.store = store
-        self.urls = urls            # callable(kind, id, base_url) -> signed URL
+        self.view = view            # callable(row) -> public generation object (webhook payload)
         self.proc: Optional[mp.Process] = None
         self.conn = None
         self.state = "starting"     # starting | ready | busy | restarting | error
@@ -125,10 +148,10 @@ class Scheduler:
 
     # ------------------------------------------------------------------- job
     def _resolve_input(self, spec: Dict[str, Any], workdir: Path, name: str) -> str:
-        if spec["type"] == "asset_id":
-            a = self.store.get_asset(spec["asset_id"])
+        if spec.get("assetId"):
+            a = self.store.get_asset(spec["assetId"])
             if not a or not Path(a["path"]).exists():
-                raise JobFailure("asset_not_found", f"{name} asset {spec['asset_id']} not found")
+                raise JobFailure("asset_not_found", f"{name} asset {spec['assetId']} not found")
             return a["path"]
         suffix = Path(spec["url"].split("?")[0]).suffix[:8] or ".bin"
         return str(media.download(spec["url"], workdir / f"{name}_src{suffix}"))
@@ -136,25 +159,29 @@ class Scheduler:
     def _process(self, job: Dict[str, Any]) -> None:
         lid = job["id"]
         req = json.loads(job["request"])
+        inputs = job_inputs(req)
+        mode = job_sync_mode(req)
         workdir = settings.work_dir / lid
         workdir.mkdir(parents=True, exist_ok=True)
         t0 = time.perf_counter()
         try:
             try:
-                vsrc = self._resolve_input(req["video"], workdir, "video")
-                asrc = self._resolve_input(req["audio"], workdir, "audio")
-                wav = workdir / "audio.wav"
-                adur = media.prepare_audio(asrc, wav)
+                vsrc = self._resolve_input(inputs["video"], workdir, "video")
+                asrc = self._resolve_input(inputs["audio"], workdir, "audio")
                 vinfo = media.probe(vsrc)
                 if not vinfo["video"]:
                     raise JobFailure("invalid_video", "video input has no video stream")
                 vdur = vinfo["video"]["duration"] or vinfo["duration"]
-                out_dur = adur if req.get("enable_dynamic_duration", True) else min(adur, vdur)
+                wav = workdir / "audio.wav"
+                # cut_off: output ends with the shorter input; otherwise it follows the audio
+                adur = media.prepare_audio(asrc, wav, max_duration=vdur if mode == "cut_off" else None)
+                out_dur = min(adur, vdur) if mode == "cut_off" else adur
                 if out_dur > settings.max_duration_s:
                     raise JobFailure("duration_too_long",
                                      f"output would be {out_dur:.1f}s; limit is {settings.max_duration_s:.0f}s")
                 vprep = workdir / "video.mp4"
-                pinfo = media.prepare_video(vsrc, vprep, out_dur, workdir)
+                pinfo = media.prepare_video(vsrc, vprep, out_dur, workdir,
+                                            extend="loop" if mode == "loop" else "bounce")
             except media.MediaError as e:
                 raise JobFailure(e.code, e.message)
             t_prep = time.perf_counter() - t0
@@ -163,7 +190,7 @@ class Scheduler:
             budget = settings.job_timeout_base_s + settings.job_timeout_per_frame_s * frames
             out_tmp = workdir / "out.mp4"
             self.conn.send({"id": lid, "video": str(vprep), "audio": str(wav), "output": str(out_tmp),
-                            "precision": req.get("mode") == "precision"})
+                            "precision": job_precision(req)})
             if not self.conn.poll(budget):
                 log.error("job %s exceeded %.0fs budget; killing GPU worker", lid, budget)
                 self._kill_worker()
@@ -180,8 +207,8 @@ class Scheduler:
             final = settings.outputs_dir / f"{lid}.mp4"
             shutil.move(str(out_tmp), final)
             dur = media.probe(str(final))["duration"]
-            log.info("job %s done: prep %.1fs, gpu %.1fs, total %.1fs, %.1fs video",
-                     lid, t_prep, res.get("wall_s", 0), time.perf_counter() - t0, dur)
+            log.info("job %s done (%s): prep %.1fs, gpu %.1fs, total %.1fs, %.1fs video",
+                     lid, mode, t_prep, res.get("wall_s", 0), time.perf_counter() - t0, dur)
             self._finish(job, output=str(final), duration=dur)
         except JobFailure as e:
             log.warning("job %s failed: %s %s", lid, e.code, e.message)
@@ -203,20 +230,22 @@ class Scheduler:
                                       output_path=output, duration=duration)
         job = self.store.get_lipsync(lid)
         if job.get("callback_url"):
-            threading.Thread(target=self._send_lipsync_webhook, args=(job,), daemon=True).start()
-        if job.get("batch_id"):
-            self._maybe_batch_webhook(job["batch_id"])
+            body = json.dumps(self.view(job)).encode()
+            threading.Thread(target=self._post, args=(job["callback_url"], body), daemon=True).start()
 
     # -------------------------------------------------------------- webhooks
-    def _post(self, url: str, payload: Dict[str, Any]) -> None:
-        body = json.dumps(payload).encode()
-        sig = hmac.new(settings.webhook_secret, body, hashlib.sha256).hexdigest()
+    def _post(self, url: str, body: bytes) -> None:
+        """POST a webhook signed like sync.so: Sync-Signature: t=<unix>,v1=<hex HMAC-SHA256
+        of '<t>.<raw body>'>, plus a Sync-Delivery-Id that stays the same across retries."""
+        delivery = str(uuid.uuid4())
         for attempt in range(4):
             try:
                 media._check_public_host(url)
+                t = str(int(time.time()))
+                sig = hmac.new(settings.webhook_secret, t.encode() + b"." + body, hashlib.sha256).hexdigest()
                 req = urllib.request.Request(url, data=body, method="POST", headers={
-                    "Content-Type": "application/json", "User-Agent": "heygem12-api/1.0",
-                    "Signature": sig})
+                    "Content-Type": "application/json", "User-Agent": "heygem12-api/2.0",
+                    "Sync-Signature": f"t={t},v1={sig}", "Sync-Delivery-Id": delivery})
                 with urllib.request.urlopen(req, timeout=15) as r:
                     if 200 <= r.status < 300:
                         return
@@ -224,28 +253,3 @@ class Scheduler:
                 log.warning("webhook %s attempt %d failed: %s", url, attempt + 1, e)
             time.sleep(5 * (3 ** attempt))
         log.error("webhook %s gave up", url)
-
-    def _send_lipsync_webhook(self, job: Dict[str, Any]) -> None:
-        if job["status"] == "completed":
-            payload = {"event_type": "avatar_video.success", "event_data": {
-                "video_id": job["id"], "lipsync_id": job["id"],
-                "url": self.urls("output", job["id"], job["base_url"]),
-                "duration": job["duration"], "callback_id": job["callback_id"]}}
-        else:
-            payload = {"event_type": "avatar_video.fail", "event_data": {
-                "video_id": job["id"], "lipsync_id": job["id"],
-                "msg": job["failure_message"], "failure_code": job["failure_code"],
-                "callback_id": job["callback_id"]}}
-        self._post(job["callback_url"], payload)
-
-    def _maybe_batch_webhook(self, bid: str) -> None:
-        b = self.store.get_batch(bid)
-        counts = self.store.batch_counts(bid)
-        done = sum(v for k, v in counts.items() if k in TERMINAL)
-        if not b or not b["callback_url"] or done < b["total_items"]:
-            return
-        if self.store.mark_batch_notified(bid):
-            status = "failed" if counts.get("failed") == b["total_items"] else "completed"
-            payload = {"event_type": "lipsync_batch.complete",
-                       "event_data": {"batch_id": bid, "status": status, "counts_by_status": counts}}
-            threading.Thread(target=self._post, args=(b["callback_url"], payload), daemon=True).start()

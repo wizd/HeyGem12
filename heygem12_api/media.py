@@ -100,12 +100,14 @@ def download(url: str, dest: Path) -> Path:
 
 
 # -------------------------------------------------------------- preparation
-def prepare_audio(src: str, dst: Path) -> float:
-    """Any audio (or video with audio) -> 16 kHz mono PCM wav. Returns duration (s)."""
+def prepare_audio(src: str, dst: Path, max_duration: Optional[float] = None) -> float:
+    """Any audio (or video with audio) -> 16 kHz mono PCM wav, optionally cut to
+    max_duration seconds. Returns duration (s)."""
     info = probe(src)
     if not info["audio"]:
         raise MediaError("invalid_audio", "audio input has no audio stream")
-    _run([settings.ffmpeg, "-y", "-loglevel", "error", "-i", src, "-vn",
+    trim = ["-t", f"{max_duration:.3f}"] if max_duration else []
+    _run([settings.ffmpeg, "-y", "-loglevel", "error", "-i", src, "-vn", *trim,
           "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dst)])
     return probe(str(dst))["duration"]
 
@@ -148,14 +150,17 @@ def _reversed_copy(src: str, fps: float, dur: float) -> Path:
     return out
 
 
-def prepare_video(src: str, dst: Path, target_duration: Optional[float], workdir: Path) -> Dict:
+def prepare_video(src: str, dst: Path, target_duration: Optional[float], workdir: Path,
+                  extend: str = "bounce") -> Dict:
     """Re-encode the source video (h264 crf15, cfr, no audio) for the pipeline.
 
-    If target_duration exceeds the source length, the video is extended by
-    ping-pong looping (forward, reversed, forward, ...) so there is no visible
-    jump where the loop restarts; if it is shorter, the video is trimmed.
-    Returns probe info of the prepared video.
+    If target_duration exceeds the source length, the video is extended:
+    extend="bounce" plays it forward, reversed, forward, ... (no visible jump),
+    extend="loop" restarts it from the beginning. If it is shorter, the video is
+    trimmed. Returns probe info of the prepared video.
     """
+    if extend not in ("bounce", "loop"):
+        raise ValueError(f"unknown extend mode {extend!r}")
     info = probe(src)
     v = info["video"]
     if not v:
@@ -165,7 +170,7 @@ def prepare_video(src: str, dst: Path, target_duration: Optional[float], workdir
     if target_duration and target_duration > dur + 0.05:
         fwd = workdir / "fwd.mp4"
         _run([settings.ffmpeg, "-y", "-loglevel", "error", "-i", src, *_encode_args(fps), str(fwd)])
-        rev = _reversed_copy(src, fps, dur)
+        rev = _reversed_copy(src, fps, dur) if extend == "bounce" else fwd
         n = math.ceil(target_duration / dur)
         lst = workdir / "loop.txt"
         lst.write_text("".join(f"file '{(fwd if i % 2 == 0 else rev).as_posix()}'\n" for i in range(n)),

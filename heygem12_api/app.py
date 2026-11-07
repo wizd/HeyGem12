@@ -1,27 +1,31 @@
-"""HeyGen-v3-compatible HTTP API for HeyGem12 lip-sync.
+"""sync.so-style HTTP API for HeyGem12 lip-sync.
 
-Implements the /v3/lipsyncs and /v3/assets subset of HeyGen's API
-(https://developers.heygen.com), backed by the local HeyGem12 pipeline.
+Implements the lip-sync core of sync.so's v2 API (POST /v2/generate,
+GET /v2/generate/{id}, /v2/generations, /v2/assets) backed by the local
+HeyGem12 pipeline. See docs/API.md for what is and is not supported.
 """
-import base64
+import asyncio
 import hashlib
 import hmac
 import json
 import logging
 import re
-import shutil
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from . import media
 from .config import settings
-from .scheduler import Scheduler
+from .scheduler import Scheduler, job_inputs, job_precision, job_sync_mode
 from .store import Store, new_id
 
 log = logging.getLogger("heygem12_api")
@@ -32,17 +36,25 @@ MEDIA_EXT = {
     ".m4v": "video/x-m4v", ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4",
     ".aac": "audio/aac", ".ogg": "audio/ogg", ".flac": "audio/flac",
 }
-IDEM_RE = re.compile(r"^[A-Za-z0-9_:.\-]{1,255}$")
+# model name -> precision (GFPGAN face restoration before synthesis)
+MODELS = {"heygem12": False, "heygem12-hq": True}
+SYNC_MODES = ("bounce", "loop", "cut_off")
+STATUS = {"pending": "PENDING", "running": "PROCESSING", "completed": "COMPLETED", "failed": "FAILED"}
+STATUS_REV = {v: k for k, v in STATUS.items()}
+IDEM_RE = re.compile(r"^[A-Za-z0-9._~-]{1,128}$")
+FILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,255}$")
+# sync.so features this server does not implement: refused, never silently ignored
+UNSUPPORTED_TOP = ("segments", "outputAudio", "dubParams", "projectId", "dialogueEdit")
 
 
 # ------------------------------------------------------------------ errors
 class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str, param: Optional[str] = None):
-        self.status, self.code, self.message, self.param = status, code, message, param
+    def __init__(self, status: int, code: str, message: str, field: Optional[str] = None):
+        self.status, self.code, self.message, self.field = status, code, message, field
 
 
-def error_body(code: str, message: str, param: Optional[str] = None) -> Dict[str, Any]:
-    return {"error": {"code": code, "message": message, "param": param, "doc_url": DOC_URL}}
+def error_body(status: int, code: Optional[str], message: str, field: Optional[str] = None) -> Dict[str, Any]:
+    return {"message": message, "statusCode": status, "errorCode": code, "field": field, "docsUrl": DOC_URL}
 
 
 # ----------------------------------------------------------- signed URLs
@@ -54,11 +66,52 @@ def _sign(kind: str, ident: str, expires: int) -> str:
 def signed_url(kind: str, ident: str, base_url: Optional[str]) -> str:
     exp = int(time.time()) + settings.url_ttl_s
     base = settings.public_url or (base_url or "").rstrip("/")
-    return f"{base}/v3/files/{kind}/{ident}?expires={exp}&signature={_sign(kind, ident, exp)}"
+    return f"{base}/v2/files/{kind}/{ident}?expires={exp}&signature={_sign(kind, ident, exp)}"
 
 
 def _base_url(request: Request) -> str:
     return settings.public_url or str(request.base_url).rstrip("/")
+
+
+def _iso(ts: Optional[int]) -> Optional[str]:
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# ------------------------------------------------------------------ views
+def generation_view(row: Dict[str, Any]) -> Dict[str, Any]:
+    req = json.loads(row["request"])
+    done = row["status"] == "completed"
+    failed = row["status"] == "failed"
+    inputs = job_inputs(req)
+    model = req.get("model") or ("heygem12-hq" if job_precision(req) else "heygem12")
+    return {
+        "id": row["id"],
+        "createdAt": _iso(row["created_at"]),
+        "status": STATUS[row["status"]],
+        "model": model,
+        "input": [inputs["video"], inputs["audio"]],
+        "options": {"sync_mode": job_sync_mode(req)},
+        "outputUrl": signed_url("output", row["id"], row["base_url"]) if done else None,
+        "outputDuration": row["duration"] if done else None,
+        "outputFileName": req.get("outputFileName"),
+        "webhookUrl": row["callback_url"],
+        "error": row["failure_message"] if failed else None,
+        "errorCode": row["failure_code"] if failed else None,
+    }
+
+
+def asset_view(a: Dict[str, Any], base_url: str) -> Dict[str, Any]:
+    mime = a["mime_type"] or ""
+    created = _iso(a["created_at"])
+    return {
+        "id": a["id"], "createdAt": created, "updatedAt": created, "name": a["filename"],
+        "url": signed_url("asset", a["id"], base_url), "size": a["size_bytes"],
+        "format": Path(a["path"]).suffix.lstrip("."),
+        "type": "VIDEO" if mime.startswith("video/") else "AUDIO",
+        "visibility": "USER",
+    }
 
 
 # --------------------------------------------------------------- app state
@@ -67,7 +120,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
                     handlers=[logging.StreamHandler(),
                               logging.FileHandler(settings.logs_dir / "server.log", encoding="utf-8")])
 store = Store(str(settings.db_path))
-scheduler = Scheduler(store, signed_url)
+scheduler = Scheduler(store, generation_view)
 
 
 @asynccontextmanager
@@ -79,29 +132,29 @@ async def lifespan(_app: FastAPI):
     scheduler.stop()
 
 
-app = FastAPI(title="HeyGem12 API (HeyGen v3 lipsync-compatible)", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="HeyGem12 API (sync.so v2 lipsync-compatible)", version="2.0.0", lifespan=lifespan)
 
 
 @app.exception_handler(ApiError)
 async def _api_error(_req: Request, exc: ApiError):
-    return JSONResponse(error_body(exc.code, exc.message, exc.param), status_code=exc.status)
+    return JSONResponse(error_body(exc.status, exc.code, exc.message, exc.field), status_code=exc.status)
 
 
 @app.exception_handler(RequestValidationError)
 async def _validation_error(_req: Request, exc: RequestValidationError):
     e = exc.errors()[0] if exc.errors() else {}
-    param = ".".join(str(x) for x in e.get("loc", [])[1:]) or None
-    return JSONResponse(error_body("invalid_parameter", e.get("msg", "invalid request"), param),
+    field = ".".join(str(x) for x in e.get("loc", [])[1:]) or None
+    return JSONResponse(error_body(400, "invalid_parameter", e.get("msg", "invalid request"), field),
                         status_code=400)
 
 
 @app.exception_handler(StarletteHTTPException)
 async def _http_error(_req: Request, exc: StarletteHTTPException):
-    code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "error")
-    return JSONResponse(error_body(code, str(exc.detail)), status_code=exc.status_code)
+    code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code)
+    return JSONResponse(error_body(exc.status_code, code, str(exc.detail)), status_code=exc.status_code)
 
 
-OPEN_PATHS = ("/health", "/v3/files/", "/docs", "/openapi.json", "/redoc")
+OPEN_PATHS = ("/health", "/v2/files/", "/docs", "/openapi.json", "/redoc")
 
 
 @app.middleware("http")
@@ -113,8 +166,8 @@ async def _auth(request: Request, call_next):
         if not key and auth.lower().startswith("bearer "):
             key = auth[7:].strip()
         if not key or not any(hmac.compare_digest(key, k) for k in settings.api_keys()):
-            return JSONResponse(error_body("unauthorized", "missing or invalid API key "
-                                           "(send x-api-key or Authorization: Bearer)"), status_code=401)
+            return JSONResponse(error_body(401, "unauthorized", "missing or invalid API key (send x-api-key)"),
+                                status_code=401)
     return await call_next(request)
 
 
@@ -129,21 +182,6 @@ async def _json_body(request: Request) -> Dict[str, Any]:
     return body
 
 
-def _enc_token(offset: int) -> str:
-    return base64.urlsafe_b64encode(f"o:{offset}".encode()).decode().rstrip("=")
-
-
-def _dec_token(token: Optional[str]) -> int:
-    if not token:
-        return 0
-    try:
-        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode()
-        assert raw.startswith("o:")
-        return max(0, int(raw[2:]))
-    except Exception:
-        raise ApiError(400, "invalid_parameter", "invalid pagination token", "token")
-
-
 def _limit(v: Optional[str], default: int) -> int:
     try:
         n = int(v) if v is not None else default
@@ -154,104 +192,143 @@ def _limit(v: Optional[str], default: int) -> int:
     return n
 
 
-def _input_spec(v: Any, param: str) -> Dict[str, str]:
-    if not isinstance(v, dict) or v.get("type") not in ("url", "asset_id"):
-        raise ApiError(400, "invalid_parameter",
-                       f"{param} must be {{type: 'url', url}} or {{type: 'asset_id', asset_id}}", param)
-    if v["type"] == "url":
-        url = v.get("url")
-        if not isinstance(url, str) or not re.match(r"^https?://", url):
-            raise ApiError(400, "invalid_parameter", f"{param}.url must be an http(s) URL", f"{param}.url")
-        return {"type": "url", "url": url}
-    aid = v.get("asset_id")
-    if not isinstance(aid, str) or not store.get_asset(aid):
-        raise ApiError(400, "asset_not_found", f"{param}.asset_id does not exist", f"{param}.asset_id")
-    return {"type": "asset_id", "asset_id": aid}
+def _csv(v: Optional[str]) -> List[str]:
+    return [x.strip() for x in (v or "").split(",") if x.strip()]
 
 
-def _validate_lipsync(body: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
-    p = lambda name: f"{prefix}{name}"  # noqa: E731
-    for name in ("video", "audio"):
-        if name not in body:
-            raise ApiError(400, "invalid_parameter", f"{p(name)} is required", p(name))
-    req: Dict[str, Any] = {"video": _input_spec(body["video"], p("video")),
-                           "audio": _input_spec(body["audio"], p("audio"))}
-    mode = body.get("mode", "speed") or "speed"
-    if mode not in ("speed", "precision"):
-        raise ApiError(400, "invalid_parameter", "mode must be 'speed' or 'precision'", p("mode"))
-    req["mode"] = mode
-    for name in ("title", "callback_id", "callback_url", "folder_id", "fps_mode"):
-        v = body.get(name)
-        if v is not None and not isinstance(v, str):
-            raise ApiError(400, "invalid_parameter", f"{p(name)} must be a string", p(name))
-        req[name] = v
-    if req["callback_url"] and not re.match(r"^https?://", req["callback_url"]):
-        raise ApiError(400, "invalid_parameter", "callback_url must be an http(s) URL", p("callback_url"))
-    if req["folder_id"]:
-        raise ApiError(404, "not_found", "folders are not supported by this server", p("folder_id"))
-    if req["fps_mode"] not in (None, "", "cfr", "passthrough", "vfr"):
-        raise ApiError(400, "invalid_parameter", "fps_mode must be 'vfr', 'cfr' or 'passthrough'", p("fps_mode"))
-    dyn = body.get("enable_dynamic_duration", True)
-    if not isinstance(dyn, bool):
-        raise ApiError(400, "invalid_parameter", "enable_dynamic_duration must be a boolean",
-                       p("enable_dynamic_duration"))
-    req["enable_dynamic_duration"] = dyn
-    # Accepted for compatibility, no effect: captions are never produced; the source
-    # resolution is always kept.
-    for name in ("enable_caption", "keep_the_same_format"):
-        if body.get(name) not in (None, True, False):
-            raise ApiError(400, "invalid_parameter", f"{p(name)} must be a boolean", p(name))
-    # Features HeyGen offers that this server cannot do: refuse instead of ignoring.
-    for name in ("disable_music_track", "enable_speech_enhancement", "enable_watermark"):
-        if body.get(name):
-            raise ApiError(400, "unsupported_parameter", f"{p(name)}=true is not supported by this server",
-                           p(name))
-    for name in ("start_time", "end_time"):
-        if body.get(name) is not None:
-            raise ApiError(400, "unsupported_parameter", f"{p(name)} (partial lipsync) is not supported",
-                           p(name))
-    return req
+async def _save_upload(up: UploadFile, field: str) -> Dict[str, Any]:
+    """Store an uploaded file as an asset. Returns the asset row."""
+    ext = Path(up.filename or "").suffix.lower()
+    if ext not in MEDIA_EXT:
+        raise ApiError(400, "unsupported_file_type",
+                       f"unsupported file type {ext or '(none)'}; allowed: {', '.join(sorted(MEDIA_EXT))}", field)
+    aid = new_id()
+    dest = settings.assets_dir / f"{aid}{ext}"
+    limit = settings.max_upload_mb * 1024 * 1024
+    size = 0
+    with open(dest, "wb") as f:
+        while chunk := await up.read(1 << 20):
+            size += len(chunk)
+            if size > limit:
+                f.close()
+                dest.unlink(missing_ok=True)
+                raise ApiError(413, "file_too_large", f"file exceeds {settings.max_upload_mb} MB", field)
+            f.write(chunk)
+    if size == 0:
+        dest.unlink(missing_ok=True)
+        raise ApiError(400, "invalid_parameter", "file is empty", field)
+    return store.add_asset(aid, up.filename, str(dest), MEDIA_EXT[ext], size)
 
 
-def _lipsync_view(row: Dict[str, Any]) -> Dict[str, Any]:
-    done = row["status"] == "completed"
-    return {
-        "id": row["id"], "title": row["title"], "status": row["status"],
-        "callback_id": row["callback_id"], "created_at": row["created_at"],
-        "duration": row["duration"],
-        "video_url": signed_url("output", row["id"], row["base_url"]) if done else None,
-        "caption_url": None,
-        "failure_code": row["failure_code"] if row["status"] == "failed" else None,
-        "failure_message": row["failure_message"] if row["status"] == "failed" else None,
-    }
+def _drop_asset(a: Dict[str, Any]) -> None:
+    store.delete_asset(a["id"])
+    Path(a["path"]).unlink(missing_ok=True)
 
 
-STATUS_V2 = {"pending": "queued", "running": "processing", "completed": "completed", "failed": "failed"}
+def _validate_generate(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate a create-generation body; returns the normalized request stored with the job."""
+    model = body.get("model") or "heygem12"
+    if model not in MODELS:
+        raise ApiError(400, "invalid_parameter", f"model must be one of: {', '.join(MODELS)}", "model")
+    for name in UNSUPPORTED_TOP:
+        if body.get(name) not in (None, [], {}):
+            raise ApiError(400, "unsupported_parameter", f"{name} is not supported by this server", name)
+
+    items = body.get("input")
+    if not isinstance(items, list) or not items:
+        raise ApiError(400, "invalid_parameter", "input must be a list with one video and one audio item", "input")
+    found: Dict[str, Dict[str, Any]] = {}
+    for i, it in enumerate(items):
+        f = f"input[{i}]"
+        if not isinstance(it, dict):
+            raise ApiError(400, "invalid_parameter", f"{f} must be an object", f)
+        t = it.get("type")
+        if t in ("image", "text") or it.get("provider") is not None:
+            raise ApiError(400, "unsupported_parameter", f"{f}: only video and audio inputs are supported", f)
+        if t not in ("video", "audio"):
+            raise ApiError(400, "invalid_parameter", f"{f}.type must be 'video' or 'audio'", f"{f}.type")
+        if t in found:
+            raise ApiError(400, "invalid_parameter", f"input must contain exactly one {t} item", f)
+        for name in ("segments_secs", "segments_frames"):
+            if it.get(name) is not None:
+                raise ApiError(400, "unsupported_parameter", f"{f}.{name} is not supported", f"{f}.{name}")
+        url, aid = it.get("url"), it.get("assetId")
+        if bool(url) == bool(aid):
+            raise ApiError(400, "invalid_parameter", f"{f} needs exactly one of url or assetId", f)
+        if url:
+            if not isinstance(url, str) or not re.match(r"^https?://", url):
+                raise ApiError(400, "invalid_parameter", f"{f}.url must be an http(s) URL", f"{f}.url")
+            found[t] = {"type": t, "url": url}
+        else:
+            if not isinstance(aid, str) or not store.get_asset(aid):
+                raise ApiError(404, "asset_not_found", f"{f}.assetId does not exist", f"{f}.assetId")
+            found[t] = {"type": t, "assetId": aid}
+    for t in ("video", "audio"):
+        if t not in found:
+            raise ApiError(400, "invalid_parameter", f"input must contain one {t} item", "input")
+
+    opts = body.get("options") or {}
+    if not isinstance(opts, dict):
+        raise ApiError(400, "invalid_parameter", "options must be an object", "options")
+    sync_mode = opts.get("sync_mode") or "bounce"
+    if sync_mode not in SYNC_MODES:
+        code = "unsupported_parameter" if sync_mode in ("silence", "remap") else "invalid_parameter"
+        raise ApiError(400, code, f"options.sync_mode must be one of: {', '.join(SYNC_MODES)}", "options.sync_mode")
+    for k, v in opts.items():
+        if k != "sync_mode" and v is not None:
+            raise ApiError(400, "unsupported_parameter", f"options.{k} is not supported by this server",
+                           f"options.{k}")
+
+    hook = body.get("webhookUrl")
+    if hook is not None and (not isinstance(hook, str) or not re.match(r"^https?://", hook)):
+        raise ApiError(400, "invalid_parameter", "webhookUrl must be an http(s) URL", "webhookUrl")
+    fname = body.get("outputFileName")
+    if fname is not None and (not isinstance(fname, str) or not FILE_NAME_RE.match(fname)):
+        raise ApiError(400, "invalid_parameter", "outputFileName may only contain letters, digits, _ and -, "
+                       "up to 255 characters", "outputFileName")
+    return {"model": model, "precision": MODELS[model], "input": [found["video"], found["audio"]],
+            "options": {"sync_mode": sync_mode}, "webhookUrl": hook or None, "outputFileName": fname}
 
 
-async def _idempotent(request: Request, scope: str, fn):
-    """Run fn() -> (status, body) honoring an optional Idempotency-Key header."""
-    key = request.headers.get("idempotency-key")
-    if not key:
-        status, body = await fn()
-        return JSONResponse(body, status_code=status)
-    if not IDEM_RE.match(key):
-        raise ApiError(400, "invalid_parameter", "Idempotency-Key must be 1-255 chars of [A-Za-z0-9_:.-]",
-                       "Idempotency-Key")
-    prev = store.idem_get(key, scope)
-    if prev:
-        if prev["status_code"] is None:
-            raise ApiError(409, "request_in_progress", "a request with this Idempotency-Key is in progress")
-        return JSONResponse(json.loads(prev["response"]), status_code=prev["status_code"])
-    if not store.idem_reserve(key, scope):
-        raise ApiError(409, "request_in_progress", "a request with this Idempotency-Key is in progress")
+async def _read_multipart(request: Request) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """multipart/form-data create: files under video/audio, nested fields as JSON strings.
+    Returns (body, assets created from the uploaded files)."""
     try:
-        status, body = await fn()
+        form = await request.form(max_files=2, max_fields=32)
+    except Exception as e:
+        raise ApiError(400, "invalid_parameter", f"cannot parse multipart body: {e}")
+    body: Dict[str, Any] = {}
+    for k, v in form.multi_items():
+        if isinstance(v, UploadFile):
+            continue
+        if k in ("input", "options", *UNSUPPORTED_TOP):
+            try:
+                body[k] = json.loads(v) if v else None
+            except ValueError:
+                raise ApiError(400, "invalid_parameter", f"{k} must be a JSON string", k)
+        else:
+            body[k] = v
+    created: List[Dict[str, Any]] = []
+    try:
+        for k, v in form.multi_items():
+            if not isinstance(v, UploadFile):
+                continue
+            if k not in ("video", "audio"):
+                raise ApiError(400, "unsupported_parameter", f"file field {k!r} is not supported "
+                               "(use video and audio)", k)
+            a = await _save_upload(v, k)
+            created.append(a)
+            body.setdefault("input", [])
+            if not isinstance(body["input"], list):
+                raise ApiError(400, "invalid_parameter", "input must be a list", "input")
+            body["input"].append({"type": k, "assetId": a["id"]})
     except Exception:
-        store.idem_release(key, scope)
+        for a in created:
+            _drop_asset(a)
         raise
-    store.idem_store(key, scope, status, body)
-    return JSONResponse(body, status_code=status)
+    finally:
+        await form.close()
+    return body, created
 
 
 # ================================================================= routes
@@ -262,189 +339,195 @@ def health():
             "running": scheduler.current is not None}
 
 
-# ---------------------------------------------------------------- assets
-@app.post("/v3/assets")
-async def upload_asset(request: Request, file: UploadFile = File(...)):
-    async def go():
-        ext = Path(file.filename or "").suffix.lower()
-        if ext not in MEDIA_EXT:
-            raise ApiError(400, "unsupported_file_type",
-                           f"unsupported file type {ext or '(none)'}; allowed: {', '.join(sorted(MEDIA_EXT))}",
-                           "file")
-        aid = new_id()
-        dest = settings.assets_dir / f"{aid}{ext}"
-        limit = settings.max_upload_mb * 1024 * 1024
-        size = 0
-        with open(dest, "wb") as f:
-            while chunk := await file.read(1 << 20):
-                size += len(chunk)
-                if size > limit:
-                    f.close()
-                    dest.unlink(missing_ok=True)
-                    raise ApiError(413, "file_too_large", f"file exceeds {settings.max_upload_mb} MB", "file")
-                f.write(chunk)
-        if size == 0:
-            dest.unlink(missing_ok=True)
-            raise ApiError(400, "invalid_parameter", "file is empty", "file")
-        mime = MEDIA_EXT[ext]
-        store.add_asset(aid, file.filename, str(dest), mime, size)
-        return 200, {"data": {"asset_id": aid, "url": signed_url("asset", aid, _base_url(request)),
-                              "mime_type": mime, "size_bytes": size}}
-    return await _idempotent(request, "POST /v3/assets", go)
+# ------------------------------------------------------------ generations
+@app.post("/v2/generate")
+async def create_generation(request: Request):
+    key = request.headers.get("idempotency-key")
+    scope = "POST /v2/generate"
+    if key is not None:
+        if not IDEM_RE.match(key):
+            raise ApiError(400, "invalid_parameter", "Idempotency-Key must be 1-128 chars of [A-Za-z0-9._~-]",
+                           "Idempotency-Key")
+        prev = store.idem_get(key, scope)
+        if prev:
+            if prev["status_code"] is None:
+                raise ApiError(409, "request_in_progress", "a request with this Idempotency-Key is in progress")
+            row = store.get_lipsync(json.loads(prev["response"]).get("id", ""))
+            if row and row["status"] != "failed":
+                return JSONResponse(generation_view(row), status_code=200,
+                                    headers={"Idempotency-Replayed": "true"})
+            store.idem_delete(key, scope)     # original failed or was deleted: start a new one
+        if not store.idem_reserve(key, scope):
+            raise ApiError(409, "request_in_progress", "a request with this Idempotency-Key is in progress")
+    created: List[Dict[str, Any]] = []
+    try:
+        if request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
+            body, created = await _read_multipart(request)
+        else:
+            body = await _json_body(request)
+        try:
+            req = _validate_generate(body)
+        except ApiError:
+            for a in created:
+                _drop_asset(a)
+            raise
+        lid = store.add_lipsync(req, _base_url(request))
+        scheduler.notify()
+    except Exception:
+        if key is not None:
+            store.idem_release(key, scope)
+        raise
+    if key is not None:
+        store.idem_store(key, scope, 201, {"id": lid})
+    return JSONResponse(generation_view(store.get_lipsync(lid)), status_code=201)
 
 
-@app.get("/v3/assets/{asset_id}")
+def _get_row(gid: str) -> Dict[str, Any]:
+    r = store.get_lipsync(gid)
+    if not r:
+        raise ApiError(404, "generation_not_found", "generation not found", "id")
+    return r
+
+
+@app.get("/v2/generate/{gid}")
+async def get_generation(gid: str, wait: Optional[str] = None, timeout: Optional[float] = None,
+                         include: Optional[str] = None):
+    r = _get_row(gid)
+    if (wait or "").lower() == "true":
+        t = 5.0 if timeout is None else timeout
+        if not 1 <= t <= 10:
+            raise ApiError(400, "invalid_parameter", "timeout must be between 1 and 10 seconds", "timeout")
+        deadline = time.monotonic() + t
+        while r["status"] not in ("completed", "failed") and time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+            r = _get_row(gid)
+    headers = {} if r["status"] in ("completed", "failed") else {"Retry-After": "2"}
+    return JSONResponse(generation_view(r), headers=headers)
+
+
+@app.get("/v2/generations")
+def list_generations(status: Optional[str] = None, ids: Optional[str] = None,
+                     limit: Optional[str] = None, cursor: Optional[str] = None):
+    statuses = _csv(status)
+    bad = [s for s in statuses if s not in STATUS_REV]
+    if bad:
+        raise ApiError(400, "invalid_parameter", f"unknown status {bad[0]!r}; use {', '.join(STATUS_REV)}",
+                       "status")
+    if cursor and limit is None:
+        raise ApiError(400, "invalid_parameter", "cursor requires limit", "cursor")
+    n = _limit(limit, 100)
+    before = None
+    if cursor:
+        c = store.get_lipsync(cursor)
+        if not c:
+            raise ApiError(400, "invalid_parameter", "cursor must be the id of a generation", "cursor")
+        before = c["seq"]
+    rows = store.list_lipsyncs(n, before, [STATUS_REV[s] for s in statuses], _csv(ids))
+    return [generation_view(r) for r in rows[:n]]
+
+
+@app.get("/v2/generations/{gid}/download")
+def download_generation(gid: str, request: Request):
+    r = _get_row(gid)
+    if r["status"] == "failed":
+        raise ApiError(422, "generation_not_downloadable", "generation failed; see its error", "id")
+    if r["status"] != "completed":
+        raise ApiError(409, "generation_not_ready", "generation is still pending or processing", "id")
+    if not r["output_path"] or not Path(r["output_path"]).exists():
+        raise ApiError(404, "generation_output_unavailable", "output file is missing", "id")
+    return PlainTextResponse(signed_url("output", gid, _base_url(request)))
+
+
+@app.delete("/v2/generations/{gid}")
+def delete_generation(gid: str):
+    r = _get_row(gid)
+    if r["status"] == "running":
+        raise ApiError(409, "generation_in_progress", "generation is processing; delete it after it finishes")
+    store.delete_lipsync(gid)
+    if r["output_path"]:
+        Path(r["output_path"]).unlink(missing_ok=True)
+    return {"id": gid}
+
+
+# ----------------------------------------------------------------- assets
+@app.post("/v2/assets", status_code=201)
+async def create_asset(request: Request):
+    """multipart field 'file' (upload), or JSON {url, type, name} (server downloads the URL)."""
+    if request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
+        form = await request.form(max_files=1, max_fields=8)
+        try:
+            up = form.get("file")
+            if not isinstance(up, UploadFile):
+                raise ApiError(400, "invalid_parameter", "multipart upload needs a 'file' field", "file")
+            a = await _save_upload(up, "file")
+        finally:
+            await form.close()
+        return asset_view(a, _base_url(request))
+    body = await _json_body(request)
+    url, typ = body.get("url"), body.get("type")
+    if not isinstance(url, str) or not re.match(r"^https?://", url):
+        raise ApiError(400, "invalid_parameter", "url must be an http(s) URL", "url")
+    if typ not in ("VIDEO", "AUDIO"):
+        raise ApiError(400, "invalid_parameter", "type must be VIDEO or AUDIO", "type")
+    ext = Path(url.split("?")[0]).suffix.lower()
+    if ext not in MEDIA_EXT:
+        ext = ".mp4" if typ == "VIDEO" else ".wav"
+    aid = new_id()
+    dest = settings.assets_dir / f"{aid}{ext}"
+    try:
+        await run_in_threadpool(media.download, url, dest)
+        info = await run_in_threadpool(media.probe, str(dest))
+    except media.MediaError as e:
+        dest.unlink(missing_ok=True)
+        raise ApiError(422, e.code, e.message, "url")
+    if not info["video" if typ == "VIDEO" else "audio"]:
+        dest.unlink(missing_ok=True)
+        raise ApiError(422, "invalid_media", f"file has no {typ.lower()} stream", "url")
+    name = body.get("name") if isinstance(body.get("name"), str) else Path(url.split("?")[0]).name
+    a = store.add_asset(aid, name, str(dest), MEDIA_EXT[ext], dest.stat().st_size)
+    return asset_view(a, _base_url(request))
+
+
+@app.get("/v2/assets")
+def list_assets(request: Request, limit: Optional[str] = None, cursor: Optional[str] = None,
+                types: Optional[str] = None):
+    tl = [t.upper() for t in _csv(types)]
+    if any(t not in ("VIDEO", "AUDIO", "IMAGE") for t in tl):
+        raise ApiError(400, "invalid_parameter", "types must be VIDEO, AUDIO or IMAGE", "types")
+    prefixes = [t.lower() + "/" for t in tl]
+    if tl and not [p for p in prefixes if p != "image/"]:
+        return {"items": [], "nextCursor": None, "totalCount": 0}
+    n = _limit(limit, 20)
+    try:
+        off = int(cursor) if cursor else 0
+    except ValueError:
+        raise ApiError(400, "invalid_parameter", "invalid cursor", "cursor")
+    rows = store.list_assets(n, max(0, off), prefixes)
+    base = _base_url(request)
+    return {"items": [asset_view(a, base) for a in rows[:n]],
+            "nextCursor": str(off + n) if len(rows) > n else None,
+            "totalCount": store.count_assets(prefixes)}
+
+
+@app.get("/v2/assets/{asset_id}")
 def get_asset(asset_id: str, request: Request):
     a = store.get_asset(asset_id)
     if not a:
-        raise ApiError(404, "not_found", "asset not found", "asset_id")
-    return {"data": {"id": a["id"], "asset_id": a["id"], "name": a["filename"],
-                     "file_type": a["mime_type"], "mime_type": a["mime_type"],
-                     "size_bytes": a["size_bytes"], "created_at": a["created_at"],
-                     "url": signed_url("asset", a["id"], _base_url(request))}}
+        raise ApiError(404, "asset_not_found", "asset not found", "id")
+    return asset_view(a, _base_url(request))
 
 
-@app.delete("/v3/assets/{asset_id}")
+@app.delete("/v2/assets/{asset_id}")
 def delete_asset(asset_id: str):
     a = store.get_asset(asset_id)
     if not a:
-        raise ApiError(404, "not_found", "asset not found", "asset_id")
-    store.delete_asset(asset_id)
-    Path(a["path"]).unlink(missing_ok=True)
-    return {"data": {"asset_id": asset_id}}
-
-
-# -------------------------------------------------------------- lipsyncs
-@app.post("/v3/lipsyncs")
-async def create_lipsync(request: Request):
-    async def go():
-        req = _validate_lipsync(await _json_body(request))
-        lid = store.add_lipsync(req, _base_url(request))
-        scheduler.notify()
-        return 200, {"data": {"lipsync_id": lid}}
-    return await _idempotent(request, "POST /v3/lipsyncs", go)
-
-
-@app.get("/v3/lipsyncs")
-def list_lipsyncs(limit: Optional[str] = None, token: Optional[str] = None):
-    n, off = _limit(limit, 10), _dec_token(token)
-    rows = store.list_lipsyncs(n, off)
-    more = len(rows) > n
-    return {"data": [_lipsync_view(r) for r in rows[:n]], "has_more": more,
-            "next_token": _enc_token(off + n) if more else None}
-
-
-@app.get("/v3/lipsyncs/statuses")
-def lipsync_statuses(lipsync_ids: Optional[str] = None, batch_ids: Optional[str] = None):
-    ids = [x for x in (lipsync_ids or "").split(",") if x.strip()]
-    bids = [x for x in (batch_ids or "").split(",") if x.strip()]
-    if not ids and not bids:
-        raise ApiError(400, "invalid_parameter", "provide lipsync_ids and/or batch_ids", "lipsync_ids")
-    items: List[Dict[str, Any]] = []
-    for lid in ids:
-        r = store.get_lipsync(lid.strip())
-        items.append({"video_id": lid.strip(), "status": STATUS_V2[r["status"]] if r else "not_found",
-                      "error": _err(r)})
-    for bid in bids:
-        bid = bid.strip()
-        if not store.get_batch(bid):
-            items.append({"video_id": None, "batch_id": bid, "status": "not_found"})
-            continue
-        for r in store.batch_items(bid, 10_000, 0):
-            items.append({"video_id": r["id"], "batch_id": bid, "item_index": r["item_index"],
-                          "status": STATUS_V2[r["status"]], "error": _err(r)})
-    if len(items) > 100:
-        raise ApiError(400, "invalid_parameter", "at most 100 statuses per request")
-    return {"data": items, "has_more": False, "next_token": None}
-
-
-def _err(r):
-    if r and r["status"] == "failed":
-        return {"code": r["failure_code"], "message": r["failure_message"]}
-    return None
-
-
-@app.get("/v3/lipsyncs/{lipsync_id}")
-def get_lipsync(lipsync_id: str):
-    r = store.get_lipsync(lipsync_id)
-    if not r:
-        raise ApiError(404, "not_found", "lipsync not found", "lipsync_id")
-    return {"data": _lipsync_view(r)}
-
-
-@app.patch("/v3/lipsyncs/{lipsync_id}")
-async def update_lipsync(lipsync_id: str, request: Request):
-    body = await _json_body(request)
-    if not isinstance(body.get("title"), str):
-        raise ApiError(400, "invalid_parameter", "title is required", "title")
-    if not store.get_lipsync(lipsync_id):
-        raise ApiError(404, "not_found", "lipsync not found", "lipsync_id")
-    store.update_lipsync(lipsync_id, title=body["title"])
-    return {"data": _lipsync_view(store.get_lipsync(lipsync_id))}
-
-
-@app.delete("/v3/lipsyncs/{lipsync_id}")
-def delete_lipsync(lipsync_id: str):
-    r = store.get_lipsync(lipsync_id)
-    if not r:
-        raise ApiError(404, "not_found", "lipsync not found", "lipsync_id")
-    if r["status"] == "running":
-        raise ApiError(409, "lipsync_in_progress", "lipsync is processing; delete it after it finishes")
-    store.delete_lipsync(lipsync_id)
-    if r["output_path"]:
-        Path(r["output_path"]).unlink(missing_ok=True)
-    return {"data": {"id": lipsync_id}}
-
-
-# --------------------------------------------------------------- batches
-@app.post("/v3/lipsyncs/batches", status_code=202)
-async def create_batch(request: Request):
-    async def go():
-        body = await _json_body(request)
-        items = body.get("lipsyncs")
-        if not isinstance(items, list) or not 1 <= len(items) <= 100:
-            raise ApiError(400, "invalid_parameter", "lipsyncs must be a list of 1-100 items", "lipsyncs")
-        for name in ("title", "callback_url"):
-            if body.get(name) is not None and not isinstance(body[name], str):
-                raise ApiError(400, "invalid_parameter", f"{name} must be a string", name)
-        reqs = [_validate_lipsync(it if isinstance(it, dict) else {}, f"lipsyncs[{i}].")
-                for i, it in enumerate(items)]
-        base = _base_url(request)
-        bid = store.add_batch(body.get("title"), body.get("callback_url"), base, len(reqs))
-        for i, req in enumerate(reqs):
-            store.add_lipsync(req, base, batch_id=bid, item_index=i)
-        scheduler.notify()
-        return 202, {"data": {"batch_id": bid}}
-    return await _idempotent(request, "POST /v3/lipsyncs/batches", go)
-
-
-@app.get("/v3/lipsyncs/batches/{batch_id}")
-def get_batch(batch_id: str, limit: Optional[str] = None, token: Optional[str] = None):
-    b = store.get_batch(batch_id)
-    if not b:
-        raise ApiError(404, "not_found", "batch not found", "batch_id")
-    n, off = _limit(limit, 100), _dec_token(token)
-    rows = store.batch_items(batch_id, n, off)
-    more = len(rows) > n
-    raw = store.batch_counts(batch_id)
-    counts: Dict[str, int] = {}
-    for k, v in raw.items():
-        counts[STATUS_V2[k]] = counts.get(STATUS_V2[k], 0) + v
-    terminal = counts.get("completed", 0) + counts.get("failed", 0)
-    if terminal < b["total_items"]:
-        status = "processing"
-    else:
-        status = "failed" if counts.get("failed", 0) == b["total_items"] else "completed"
-    return {"data": {
-        "batch_id": batch_id, "title": b["title"], "status": status, "total_items": b["total_items"],
-        "counts_by_status": counts, "created_at": b["created_at"],
-        "items": [{"item_index": r["item_index"], "status": STATUS_V2[r["status"]], "video_id": r["id"],
-                   "error": _err(r)} for r in rows[:n]],
-        "has_more": more, "next_token": _enc_token(off + n) if more else None}}
+        raise ApiError(404, "asset_not_found", "asset not found", "id")
+    _drop_asset(a)
+    return {"id": asset_id}
 
 
 # ------------------------------------------------- signed file downloads
-@app.get("/v3/files/{kind}/{ident}")
+@app.get("/v2/files/{kind}/{ident}")
 def download_file(kind: str, ident: str, expires: int = 0, signature: str = ""):
     if kind not in ("output", "asset") or expires < time.time() or \
             not hmac.compare_digest(signature, _sign(kind, ident, expires)):
@@ -452,7 +535,8 @@ def download_file(kind: str, ident: str, expires: int = 0, signature: str = ""):
     if kind == "output":
         r = store.get_lipsync(ident)
         path = r and r["output_path"]
-        name, mime = f"{ident}.mp4", "video/mp4"
+        fname = r and json.loads(r["request"]).get("outputFileName")
+        name, mime = f"{fname or ident}.mp4", "video/mp4"
     else:
         a = store.get_asset(ident)
         path = a and a["path"]

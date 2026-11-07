@@ -1,155 +1,191 @@
-# HeyGem12 API server
+# HeyGem12 HTTP API
 
-A self-hosted HTTP API for HeyGem12 lip-sync, compatible with the **lipsync and
-asset endpoints of HeyGen's v3 API** (`/v3/lipsyncs`, `/v3/assets`). A client
-written against HeyGen's lipsync API should only need a different base URL and
-API key.
+A small HTTP service for lip-sync: send one video and one audio track, get back a
+video whose mouth movements follow the audio. The API follows the lip-sync core
+of [sync.so](https://sync.so)'s v2 API, so the request and response shapes will be
+familiar if you have used it. Features that need sync.so's cloud (text-to-speech,
+dubbing, segments, projects, batches) are not implemented and are rejected with
+an error rather than silently ignored.
 
 ```
-POST /v3/assets                      upload a video/audio file   -> asset_id
-POST /v3/lipsyncs                    start a job (video + audio) -> lipsync_id
-GET  /v3/lipsyncs/{id}               poll: pending | running | completed | failed (+ video_url)
+POST /v2/generate                      create a job (JSON or multipart)       -> 201 generation
+GET  /v2/generate/{id}                 poll (optional ?wait=true long-poll)   -> generation
+GET  /v2/generations                   list jobs
+GET  /v2/generations/{id}/download     signed download URL (text/plain)
+DELETE /v2/generations/{id}
+POST /v2/assets                        upload a file, or register a URL       -> 201 asset
+GET  /v2/assets, GET/DELETE /v2/assets/{id}
+GET  /health                           no key needed
 ```
 
 ## Running
 
-```bat
-uv pip install -r requirements-api.txt        (into the same venv as HeyGem12)
-python -m heygem12_api
+```bash
+pip install -r requirements-api.txt        # plus the pipeline's own requirements
+python -m heygem12_api                     # listens on 0.0.0.0:8800
 ```
 
-`ffmpeg` and `ffprobe` must be on PATH. On first start the server creates
-`data\api_keys.txt` with one generated key. Add or remove keys there (one per line;
-the file is read on every request, so no restart is needed).
+`ffmpeg` and `ffprobe` must be on `PATH`. On first start the server creates
+`data/api_keys.txt` (one key per line; add or remove lines to manage keys, no
+restart needed) and the URL-signing and webhook secrets in `data/`.
 
-| Environment variable | Default | Meaning |
+| Variable | Default | Meaning |
 |---|---|---|
 | `HEYGEM12_API_HOST` / `_PORT` | `0.0.0.0` / `8800` | Listen address |
-| `HEYGEM12_API_PUBLIC_URL` | (request host) | Base URL used in `video_url`s and webhooks, e.g. `https://lipsync.example.com` |
-| `HEYGEM12_API_DATA` | `.\data` | Database, uploaded assets, outputs, logs, secrets |
-| `HEYGEM12_API_DEVICE` | `cuda` | torch device (`cuda` also covers ROCm GPUs) |
-| `HEYGEM12_API_MAX_UPLOAD_MB` | `1024` | Upload / URL-download size limit |
-| `HEYGEM12_API_MAX_DURATION` | `600` | Longest output in seconds (frames are held in RAM, ~6 GB per minute at 720p) |
-| `HEYGEM12_API_ALLOW_PRIVATE_URLS` | `0` | Allow `url` inputs and `callback_url`s on private or loopback addresses |
-| `HEYGEM12_API_JOB_TIMEOUT_BASE` / `_PER_FRAME` | `300` / `0.5` | Watchdog budget per job; on overrun the GPU worker is killed and restarted |
-| `HEYGEM12_API_URL_TTL` | `604800` | Lifetime of signed download links (seconds) |
-| `HEYGEM12_API_WARMUP` | `1` | Warm up the GPU when the worker starts (~16 s) so the first job isn't slow |
+| `HEYGEM12_API_PUBLIC_URL` | (request host) | Base URL used in `outputUrl`s, e.g. `https://lipsync.example.com` |
+| `HEYGEM12_API_DATA` | `./data` | Database, uploads, outputs, logs, secrets |
+| `HEYGEM12_API_CHECKPOINTS` | `./checkpoints` | Model weights |
+| `HEYGEM12_API_DEVICE` | `cuda` | Torch device (`cuda` also means ROCm builds) |
+| `HEYGEM12_API_MAX_UPLOAD_MB` | `1024` | Per-file limit for uploads and URL downloads |
+| `HEYGEM12_API_MAX_DURATION` | `600` | Longest output in seconds (all frames are held in RAM) |
+| `HEYGEM12_API_ALLOW_PRIVATE_URLS` | `0` | Allow input/webhook URLs that resolve to private addresses |
+| `HEYGEM12_API_JOB_TIMEOUT_BASE` / `_PER_FRAME` | `300` / `0.5` | Watchdog budget; the GPU worker is restarted on overrun |
+| `HEYGEM12_API_URL_TTL` | `604800` | Lifetime of signed download URLs (seconds) |
+| `HEYGEM12_API_WARMUP` | `1` | Run a short warm-up job when the worker starts |
 
-## Conventions (same as HeyGen v3)
+## Conventions
 
-- **Auth:** `x-api-key: <key>` or `Authorization: Bearer <key>`.
-- **Success:** `{"data": ...}`. **Errors:** `{"error": {"code", "message", "param", "doc_url"}}`
-  with HTTP 400/401/403/404/409/413.
-- **Idempotency:** optional `Idempotency-Key` header on POSTs (1–255 chars of `[A-Za-z0-9_:.-]`).
-  A repeat within 24 h replays the original response; a concurrent repeat gets 409 `request_in_progress`.
-- **Pagination:** `limit` (1–100) and an opaque `token`; responses carry `has_more` and `next_token`.
-- **Download URLs** (`video_url`, asset `url`) are signed and expire (default 7 days). They need no API key.
+- **Auth:** `x-api-key: <key>` (or `Authorization: Bearer <key>`).
+- **IDs** are UUIDs. Timestamps are ISO 8601 UTC.
+- **Errors** are JSON: `{"message", "statusCode", "errorCode", "field", "docsUrl"}`.
+  Branch on `errorCode`, not on `message`.
+- **Idempotency:** send `Idempotency-Key` (1–128 chars of `[A-Za-z0-9._~-]`) on
+  `POST /v2/generate`. A retry with the same key returns `200` with the original
+  generation and `Idempotency-Replayed: true`; if the original failed or was
+  deleted, a new one is started (`201`). Keys are kept for 7 days.
+- **Download URLs** (`outputUrl`, asset `url`) are signed and expire (7 days by
+  default). They need no API key, so treat them as secrets.
 
-## Endpoints
+## Create a generation — `POST /v2/generate`
 
-### `POST /v3/assets`: upload a file
-`multipart/form-data` with a `file` field. Types: mp4 mov webm mkv m4v mp3 wav m4a aac ogg flac.
+JSON form; each input is given by `url` or `assetId`:
+
 ```json
-{"data": {"asset_id": "…", "url": "…signed…", "mime_type": "video/mp4", "size_bytes": 8360134}}
-```
-`GET /v3/assets/{asset_id}` returns metadata and a fresh signed `url`. `DELETE /v3/assets/{asset_id}` removes the asset.
-
-### `POST /v3/lipsyncs`: create a lipsync job
-```jsonc
 {
-  "video": {"type": "asset_id", "asset_id": "…"},         // or {"type": "url", "url": "https://…"}
-  "audio": {"type": "url", "url": "https://…/voice.mp3"},  // or {"type": "asset_id", …}
-  "title": "optional",
-  "mode": "speed",                     // "precision" = GFPGAN face restoration before lip-sync (~2x slower)
-  "enable_dynamic_duration": true,     // see below
-  "callback_url": "https://…", "callback_id": "your-id"
+  "model": "heygem12",
+  "input": [
+    {"type": "video", "url": "https://example.com/face.mp4"},
+    {"type": "audio", "assetId": "3f0c…"}
+  ],
+  "options": {"sync_mode": "bounce"},
+  "webhookUrl": "https://example.com/hook",
+  "outputFileName": "my_clip"
 }
 ```
-Response: `{"data": {"lipsync_id": "…"}}`
 
-**Output length.** With `enable_dynamic_duration: true` (the default) the output matches the
-audio length. If the audio is longer than the video, the video is extended by
-ping-pong looping (forward, reversed, forward …), which avoids a visible jump at the
-loop point; if the audio is shorter, the video is trimmed. With `false`, the output
-stops at the shorter of the video and the audio.
+Multipart form, to send local files directly: file fields `video` and `audio`,
+other fields as plain values, `input` and `options` as JSON strings. Uploaded
+files are stored as assets.
 
-**Differences from HeyGen.**
-- Accepted but no effect: `enable_caption` and `keep_the_same_format`. No captions are
-  produced (`caption_url` is always null), and the source resolution is always kept.
-- Rejected with 400 `unsupported_parameter`: `disable_music_track`,
-  `enable_speech_enhancement` or `enable_watermark` set to true, and `start_time`/`end_time`.
-- A non-empty `folder_id` gets 404.
-
-### `GET /v3/lipsyncs/{lipsync_id}`
-```json
-{"data": {"id": "…", "title": "…", "status": "completed", "callback_id": "…",
-          "created_at": 1794067000, "duration": 63.36,
-          "video_url": "…signed…", "caption_url": null,
-          "failure_code": null, "failure_message": null}}
-```
-`status` goes `pending` → `running` → `completed` or `failed`. Jobs run one at a time on the GPU, in submission order.
-
-Also available:
-- `GET /v3/lipsyncs`: list jobs, newest first.
-- `PATCH /v3/lipsyncs/{id}`: rename (`{"title"}`).
-- `DELETE /v3/lipsyncs/{id}`: delete a job and its output (409 while it is running).
-- `GET /v3/lipsyncs/statuses?lipsync_ids=a,b&batch_ids=c`: statuses
-  `queued | processing | completed | failed | not_found`.
-
-### Batches
-`POST /v3/lipsyncs/batches` returns **202** `{"data": {"batch_id"}}`.
-```jsonc
-{"title": "optional",
- "callback_url": "optional; called once when every item has finished",
- "lipsyncs": [ {…same shape as POST /v3/lipsyncs…}, … ]}   // 1–100 items
-```
-`GET /v3/lipsyncs/batches/{batch_id}` returns `status` (`processing | completed | failed`),
-`counts_by_status`, and `items[]` with `item_index`, `status`, `video_id` (= lipsync id) and `error`.
-
-### Webhooks
-When a job with a `callback_url` finishes, the server POSTs JSON to it (up to 4 attempts):
-```json
-{"event_type": "avatar_video.success",
- "event_data": {"video_id": "…", "lipsync_id": "…", "url": "…signed…", "duration": 63.36, "callback_id": "…"}}
-{"event_type": "avatar_video.fail",
- "event_data": {"video_id": "…", "lipsync_id": "…", "msg": "…", "failure_code": "…", "callback_id": "…"}}
-```
-A batch-level `callback_url` receives `{"event_type": "lipsync_batch.complete", "event_data":
-{"batch_id", "status", "counts_by_status"}}` once. Items get their own webhook only if
-they set their own `callback_url`.
-
-Every webhook request carries a `Signature` header: the hex HMAC-SHA256 of the raw body,
-keyed with the secret in `data\webhook.secret`. The event names follow HeyGen's
-`avatar_video.*` events. HeyGen does not publish a lipsync-specific event name, so this
-part of the format is HeyGem12's own.
-
-### Other
-- `GET /health` (no auth): `{"status", "worker", "queue_length", "running"}`.
-- Interactive docs at `/docs`.
-
-## Failure codes
-`invalid_video`, `invalid_audio`, `invalid_media`, `download_failed`, `invalid_url`,
-`file_too_large`, `duration_too_long`, `asset_not_found`, `processing_failed`
-(pipeline error, e.g. no face found), `timeout` (the watchdog killed the GPU worker),
-`worker_crashed`, `internal_error`.
-
-## Example (curl)
 ```bash
-KEY=hg12_…; API=http://server:8800
-V=$(curl -s -H "x-api-key: $KEY" -F file=@face.mp4  $API/v3/assets | jq -r .data.asset_id)
-A=$(curl -s -H "x-api-key: $KEY" -F file=@voice.wav $API/v3/assets | jq -r .data.asset_id)
-ID=$(curl -s -H "x-api-key: $KEY" -H 'Content-Type: application/json' $API/v3/lipsyncs \
-  -d "{\"video\":{\"type\":\"asset_id\",\"asset_id\":\"$V\"},\"audio\":{\"type\":\"asset_id\",\"asset_id\":\"$A\"}}" \
-  | jq -r .data.lipsync_id)
-curl -s -H "x-api-key: $KEY" $API/v3/lipsyncs/$ID      # poll until status is "completed", then download video_url
+curl -H "x-api-key: $KEY" -F model=heygem12 -F video=@face.mp4 -F audio=@voice.wav \
+     -F 'options={"sync_mode":"cut_off"}' $API/v2/generate
 ```
+
+| Field | Values |
+|---|---|
+| `model` | `heygem12` (default, fastest) or `heygem12-hq` (GFPGAN face restoration first; about 1.8× slower) |
+| `input` | exactly one `video` and one `audio` item |
+| `options.sync_mode` | what to do when the lengths differ, see below |
+| `webhookUrl` | http(s) URL notified when the job ends |
+| `outputFileName` | download file name without extension (`[A-Za-z0-9_-]`, ≤255) |
+
+`sync_mode` — the output always uses the whole audio unless `cut_off` is chosen:
+
+| Mode | Audio longer than video | Audio shorter than video |
+|---|---|---|
+| `bounce` (default) | video plays forward, backward, forward… (no visible jump) | video is trimmed |
+| `loop` | video restarts from the beginning | video is trimmed |
+| `cut_off` | audio is cut at the end of the video | video is trimmed |
+
+Refused with `400 unsupported_parameter`: `image` and `text` (TTS) inputs,
+`segments_secs`/`segments_frames`, top-level `segments`, `outputAudio`,
+`dubParams`, `projectId`, `dialogueEdit`, sync modes `silence` and `remap`, and
+any other `options` key (e.g. `temperature`, `active_speaker_detection`).
+
+Response (`201`), also returned by `GET /v2/generate/{id}` and sent to webhooks:
+
+```json
+{
+  "id": "1b6e…", "createdAt": "2026-11-07T18:40:02Z",
+  "status": "COMPLETED",
+  "model": "heygem12",
+  "input": [{"type": "video", "assetId": "…"}, {"type": "audio", "assetId": "…"}],
+  "options": {"sync_mode": "bounce"},
+  "outputUrl": "http://host:8800/v2/files/output/1b6e…?expires=…&signature=…",
+  "outputDuration": 6.0, "outputFileName": "my_clip",
+  "webhookUrl": null, "error": null, "errorCode": null
+}
+```
+
+`status` is `PENDING` → `PROCESSING` → `COMPLETED` or `FAILED`. `outputUrl` and
+`outputDuration` are set only when completed; `error`/`errorCode` only when failed.
+
+## Poll and download
+
+- `GET /v2/generate/{id}` — current state. Non-final responses carry `Retry-After: 2`.
+  `?wait=true&timeout=N` (1–10 s, default 5) holds the request until the job
+  finishes or the timeout passes.
+- `GET /v2/generations?status=COMPLETED,FAILED&ids=a,b&limit=20&cursor=<id>` —
+  newest first, a JSON array. `cursor` is the id of the last item of the previous
+  page and requires `limit`.
+- `GET /v2/generations/{id}/download` — a fresh signed URL as `text/plain`.
+  `409 generation_not_ready` while pending/processing, `422 generation_not_downloadable` if failed.
+- `DELETE /v2/generations/{id}` — removes the job and its output (`409` while processing).
+
+## Assets
+
+- `POST /v2/assets` multipart with a `file` field → asset. Or JSON
+  `{"url": "https://…", "type": "VIDEO" | "AUDIO", "name": "…"}`: the server
+  downloads and checks the file now, so later jobs don't depend on the URL.
+- `GET /v2/assets?limit=20&cursor=…&types=VIDEO,AUDIO` → `{items, nextCursor, totalCount}`.
+- `GET /v2/assets/{id}`, `DELETE /v2/assets/{id}`.
+
+Asset object: `{id, createdAt, updatedAt, name, url, size, format, type, visibility}`.
+Accepted files: mp4, mov, webm, mkv, m4v, mp3, wav, m4a, aac, ogg, flac.
+
+## Webhooks
+
+When a job with `webhookUrl` ends, the server POSTs the generation object (as
+above) to it, with:
+
+- `Sync-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256>`, computed over
+  `"<t>.<raw body>"` with the secret in `data/webhook.secret`;
+- `Sync-Delivery-Id`, unchanged across retries (use it to de-duplicate).
+
+Delivery is retried up to 4 times (5 s, 15 s, 45 s, 135 s). Verify like this:
+
+```python
+t, v1 = (p.split("=", 1)[1] for p in header.split(","))
+ok = hmac.compare_digest(v1, hmac.new(secret, f"{t}.".encode() + raw_body, hashlib.sha256).hexdigest())
+```
+
+## Failure codes (`errorCode` on a failed generation)
+
+`download_failed`, `invalid_url`, `file_too_large`, `invalid_media`,
+`invalid_video`, `invalid_audio`, `asset_not_found`, `duration_too_long`,
+`timeout` (GPU worker was restarted), `worker_crashed`, `processing_failed`,
+`internal_error`.
+
+## Differences from sync.so
+
+- Models are `heygem12` / `heygem12-hq`, not sync.so's model names.
+- No TTS, dubbing, segments, image input, batches, projects, cost estimates,
+  `include=progress`, or `GET /v2/errors`.
+- Assets are uploaded directly (`POST /v2/assets` multipart) instead of through
+  presigned upload URLs; `POST /v2/assets/upload` does not exist.
+- Without an `Idempotency-Key`, identical requests are not rejected as duplicates.
+- Webhook secret is a local file, not `GET /v2/organizations/webhook/secret`.
+- The spec was taken from sync.so's official Python SDK (`syncsdk` 0.4.0); it has
+  not been tested with sync.so's own client libraries.
 
 ## Operational notes
-- One GPU worker process keeps the models loaded. If a job exceeds its time budget,
-  the worker is killed and restarted and the job fails with `timeout`. A hard GPU
-  driver hang can make the worker unkillable; the machine then needs a reboot.
-- Jobs left `running` when the server stops are re-queued on the next start.
-- Outputs and assets are kept until they are deleted through the API.
-- URL inputs and callbacks to private or loopback addresses are refused unless
-  `HEYGEM12_API_ALLOW_PRIVATE_URLS=1`.
-- The server handles one job at a time; a long job blocks the queue behind it.
+
+- One job runs at a time; others wait in a FIFO queue that survives restarts
+  (jobs left running are re-queued).
+- Input and webhook URLs must resolve to public addresses unless
+  `HEYGEM12_API_ALLOW_PRIVATE_URLS=1`; redirects are re-checked.
+- The server speaks plain HTTP. For internet use, put it behind an HTTPS
+  reverse proxy and set `HEYGEM12_API_PUBLIC_URL`.
+- Jobs created by the 1.x (HeyGen-style `/v3`) API remain readable through
+  `/v2/generate/{id}` and `/v2/generations`.

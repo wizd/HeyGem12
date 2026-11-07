@@ -170,12 +170,12 @@ pipe = LipSyncPipeline("checkpoints", device="cpu")
 pipe.run("input.mp4", "voice.wav", "result.mp4")
 ```
 
-## HTTP API (HeyGen-compatible)
+## HTTP API (sync.so-style)
 
-`heygem12_api` serves the pipeline over HTTP, compatible with the lipsync and
-asset endpoints of HeyGen's v3 API (`POST /v3/assets`, `POST /v3/lipsyncs`,
-`GET /v3/lipsyncs/{id}`, batches, webhooks). Jobs run on a single GPU worker
-that keeps the models loaded.
+`heygem12_api` serves the pipeline over HTTP using the lip-sync core of
+sync.so's v2 API: `POST /v2/generate` (one video + one audio, by URL, asset id
+or direct file upload), `GET /v2/generate/{id}` to poll, assets, and signed
+webhooks. Jobs run on a single GPU worker that keeps the models loaded.
 
 ```bash
 .venv\Scripts\python -m pip install -r requirements-api.txt
